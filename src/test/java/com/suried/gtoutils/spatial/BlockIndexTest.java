@@ -130,6 +130,17 @@ class BlockIndexTest {
     }
 
     @Test
+    void findAnyOverWholeIndexSearchesEveryRegion() {
+        BlockIndex<String> index = new BlockIndex<>();
+        assertNull(index.findAny(s -> true));
+        index.put(0, 0, 0, "near");
+        index.put(5000, -60, -9000, "far");
+        assertEquals("far", index.findAny(s -> s.equals("far")));
+        assertEquals("near", index.findAny(s -> s.startsWith("n")));
+        assertNull(index.findAny(s -> s.equals("none")));
+    }
+
+    @Test
     void queriesAcrossRegionBoundariesMatchBruteForce() {
         BlockIndex<int[]> index = new BlockIndex<>();
         List<int[]> all = new ArrayList<>();

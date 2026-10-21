@@ -1,0 +1,19 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.suried.gtoutils.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "gtoutils.refmap.json",
+  "mixins": [
+    "BlockEntityMixin",
+    "LevelChunkMixin",
+    "LevelMixin"
+  ],
+  "client": [
+    "client.ClientChunkCacheMixin",
+    "client.ClientChunkStorageMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

@@ -1,7 +1,8 @@
 package com.suried.gtoutils;
 
-import com.suried.gtoutils.spatial.LevelBlockIndex;
+import com.suried.gtoutils.spatial.LevelStore;
 
+import net.minecraft.world.level.Level;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.level.LevelEvent;
 import net.minecraftforge.fml.common.Mod;
@@ -16,6 +17,6 @@ public final class GTOUtils {
     }
 
     private static void onLevelUnload(LevelEvent.Unload event) {
-        LevelBlockIndex.releaseAll(event.getLevel());
+        if (event.getLevel() instanceof Level level) LevelStore.releaseAll(level);
     }
 }
