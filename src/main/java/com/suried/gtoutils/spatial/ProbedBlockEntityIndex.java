@@ -1,5 +1,7 @@
 package com.suried.gtoutils.spatial;
 
+import com.suried.gtoutils.level.LevelSlotHolder;
+
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.BlockEntity;
@@ -48,22 +50,22 @@ public final class ProbedBlockEntityIndex {
     }
 
     public int query(Level level, BlockPos center, BlockRange range, @Nullable Predicate<? super BlockEntity> filter, Collection<? super BlockEntity> out) {
-        return sink.query((LevelIndexHolder) level, center.getX(), center.getY(), center.getZ(), range, filter, out);
+        return sink.query((LevelSlotHolder) level, center.getX(), center.getY(), center.getZ(), range, filter, out);
     }
 
     public void forEach(Level level, BlockPos center, BlockRange range, @Nullable Predicate<? super BlockEntity> filter, Consumer<? super BlockEntity> action) {
-        sink.forEach((LevelIndexHolder) level, center.getX(), center.getY(), center.getZ(), range, filter, action);
+        sink.forEach((LevelSlotHolder) level, center.getX(), center.getY(), center.getZ(), range, filter, action);
     }
 
     public @Nullable BlockEntity findAny(Level level, BlockPos center, BlockRange range, @Nullable Predicate<? super BlockEntity> filter) {
-        return sink.findAny((LevelIndexHolder) level, center.getX(), center.getY(), center.getZ(), range, filter);
+        return sink.findAny((LevelSlotHolder) level, center.getX(), center.getY(), center.getZ(), range, filter);
     }
 
     public int candidateCount(Level level) {
-        return sink.candidateCount((LevelIndexHolder) level);
+        return sink.candidateCount((LevelSlotHolder) level);
     }
 
     public int sweptSectionCount(Level level) {
-        return sink.sweptSectionCount((LevelIndexHolder) level);
+        return sink.sweptSectionCount((LevelSlotHolder) level);
     }
 }

@@ -1,5 +1,7 @@
 package com.suried.gtoutils.spatial;
 
+import com.suried.gtoutils.level.LevelSlotHolder;
+
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -13,8 +15,8 @@ public final class BlockEntityTracking {
     static final Tracker<BlockEntity> TRACKER = new Tracker<>(new Tracker.Access<>() {
 
         @Override
-        public @Nullable LevelIndexHolder holder(BlockEntity be) {
-            return be.getLevel() instanceof LevelIndexHolder holder ? holder : null;
+        public @Nullable LevelSlotHolder holder(BlockEntity be) {
+            return be.getLevel() instanceof LevelSlotHolder holder ? holder : null;
         }
 
         @Override

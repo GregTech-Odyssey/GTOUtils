@@ -1,5 +1,8 @@
 package com.suried.gtoutils.spatial;
 
+import com.suried.gtoutils.level.LevelSlotHolder;
+import com.suried.gtoutils.level.LevelStore;
+
 import net.minecraft.world.level.Level;
 
 import org.jetbrains.annotations.Nullable;
@@ -36,16 +39,16 @@ public final class LevelBlockIndex<T> {
         store.release(level);
     }
 
-    BlockIndex<T> forHolder(LevelIndexHolder holder) {
+    BlockIndex<T> forHolder(LevelSlotHolder holder) {
         return store.forHolder(holder);
     }
 
     @Nullable
-    BlockIndex<T> forHolderIfPresent(LevelIndexHolder holder) {
+    BlockIndex<T> forHolderIfPresent(LevelSlotHolder holder) {
         return store.forHolderIfPresent(holder);
     }
 
-    void releaseHolder(LevelIndexHolder holder) {
+    void releaseHolder(LevelSlotHolder holder) {
         store.releaseHolder(holder);
     }
 }

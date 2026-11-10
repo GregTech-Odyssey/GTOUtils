@@ -1,5 +1,7 @@
 package com.suried.gtoutils.spatial;
 
+import com.suried.gtoutils.level.FakeLevel;
+
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;

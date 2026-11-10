@@ -1,5 +1,7 @@
 package com.suried.gtoutils.spatial;
 
+import com.suried.gtoutils.level.LevelSlotHolder;
+
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.BlockEntity;
@@ -52,7 +54,7 @@ public final class BlockEntityIndex<T> {
     }
 
     private @Nullable BlockIndex<T> index(Level level) {
-        return sink.index((LevelIndexHolder) level);
+        return sink.index((LevelSlotHolder) level);
     }
 
     public int query(Level level, int x, int y, int z, BlockRange range, @Nullable Predicate<? super T> filter, Collection<? super T> out) {

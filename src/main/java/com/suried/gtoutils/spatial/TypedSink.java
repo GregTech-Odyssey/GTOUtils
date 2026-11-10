@@ -1,5 +1,7 @@
 package com.suried.gtoutils.spatial;
 
+import com.suried.gtoutils.level.LevelSlotHolder;
+
 import net.minecraft.core.BlockPos;
 
 import org.jetbrains.annotations.Nullable;
@@ -32,20 +34,20 @@ final class TypedSink<E, T> extends Tracker.Sink<E> {
     }
 
     @Override
-    void added(LevelIndexHolder holder, E e, BlockPos pos) {
+    void added(LevelSlotHolder holder, E e, BlockPos pos) {
         T t = type.cast(e);
         if (admit != null && !admit.test(t)) return;
         store.forHolder(holder).put(pos, t);
     }
 
     @Override
-    void removed(LevelIndexHolder holder, E e, BlockPos pos) {
+    void removed(LevelSlotHolder holder, E e, BlockPos pos) {
         BlockIndex<T> index = store.forHolderIfPresent(holder);
         if (index != null) index.remove(pos, type.cast(e));
     }
 
     @Nullable
-    BlockIndex<T> index(LevelIndexHolder holder) {
+    BlockIndex<T> index(LevelSlotHolder holder) {
         return store.forHolderIfPresent(holder);
     }
 }

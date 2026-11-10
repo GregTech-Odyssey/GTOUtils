@@ -1,5 +1,7 @@
 package com.suried.gtoutils.spatial;
 
+import com.suried.gtoutils.level.LevelSlotHolder;
+
 import net.minecraft.core.BlockPos;
 
 import org.jetbrains.annotations.Nullable;
@@ -21,7 +23,7 @@ final class Tracker<E> {
     interface Access<E> {
 
         @Nullable
-        LevelIndexHolder holder(E e);
+        LevelSlotHolder holder(E e);
 
         BlockPos pos(E e);
 
@@ -36,9 +38,9 @@ final class Tracker<E> {
 
         abstract boolean accepts(Class<?> type);
 
-        abstract void added(LevelIndexHolder holder, E e, BlockPos pos);
+        abstract void added(LevelSlotHolder holder, E e, BlockPos pos);
 
-        abstract void removed(LevelIndexHolder holder, E e, BlockPos pos);
+        abstract void removed(LevelSlotHolder holder, E e, BlockPos pos);
     }
 
     private final Access<E> access;
@@ -93,7 +95,7 @@ final class Tracker<E> {
         if (!started) start();
         Sink<E>[] targets = byClass.get(e.getClass());
         if (targets.length == 0) return;
-        LevelIndexHolder holder = access.holder(e);
+        LevelSlotHolder holder = access.holder(e);
         if (holder == null) return;
         BlockPos pos = access.pos(e);
         for (Sink<E> sink : targets) sink.added(holder, e, pos);
@@ -103,7 +105,7 @@ final class Tracker<E> {
         if (!started) start();
         Sink<E>[] targets = byClass.get(e.getClass());
         if (targets.length == 0) return;
-        LevelIndexHolder holder = access.holder(e);
+        LevelSlotHolder holder = access.holder(e);
         if (holder == null) return;
         BlockPos pos = access.pos(e);
         for (Sink<E> sink : targets) sink.removed(holder, e, pos);

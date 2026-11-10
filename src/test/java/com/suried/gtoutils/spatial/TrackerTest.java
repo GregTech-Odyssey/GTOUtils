@@ -1,5 +1,7 @@
 package com.suried.gtoutils.spatial;
 
+import com.suried.gtoutils.level.FakeLevel;
+
 import net.minecraft.core.BlockPos;
 
 import org.junit.jupiter.api.Test;

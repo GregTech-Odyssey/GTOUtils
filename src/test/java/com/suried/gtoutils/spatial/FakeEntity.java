@@ -1,5 +1,9 @@
 package com.suried.gtoutils.spatial;
 
+import com.suried.gtoutils.level.FakeLevel;
+
+import com.suried.gtoutils.level.LevelSlotHolder;
+
 import net.minecraft.core.BlockPos;
 
 class FakeEntity {
@@ -7,7 +11,7 @@ class FakeEntity {
     static final Tracker.Access<FakeEntity> ACCESS = new Tracker.Access<>() {
 
         @Override
-        public LevelIndexHolder holder(FakeEntity e) {
+        public LevelSlotHolder holder(FakeEntity e) {
             return e.level;
         }
 
