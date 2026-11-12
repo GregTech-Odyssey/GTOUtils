@@ -14,6 +14,7 @@ import java.util.Objects;
  * <li>{@link Lease#demand}：借用者声明是否需要资源工作；{@link Pooled#demanded} 汇总为"至少一个借用者需要"，在派生里读取时自动追踪</li>
  * <li>{@link #peek}/{@link #size}：查看已有资源与资源数</li>
  * <li>池所在的作用域结束后全部资源结束，之后的借用拿到的是已结束作用域里的资源</li>
+ * <li>池作用域与资源作用域都不是 {@link OwnedScope}，{@link Pooled#scope} 拿到的一方强转后结束不了</li>
  * </ul>
  */
 public final class SharedPool<K, V> {
@@ -24,41 +25,42 @@ public final class SharedPool<K, V> {
         V create(Pooled pooled, K key);
     }
 
-    private final OwnedScope root;
+    private final Scope root;
     private final int grace;
     private final Factory<K, V> factory;
     private final HashMap<K, Pooled> slots = new HashMap<>();
 
-    SharedPool(OwnedScope root, int grace, Factory<K, V> factory) {
+    SharedPool(Scope root, int grace, Factory<K, V> factory) {
         this.root = root;
         this.grace = Math.max(0, grace);
         this.factory = Objects.requireNonNull(factory, "factory");
-        root.onDispose(slots::clear);
+        root.undo(slots::clear);
     }
 
     @SuppressWarnings("unchecked")
     Lease<V> lease(Scope borrower, K key) {
         Pooled slot = slots.get(key);
+        if (slot != null && slot.value == null) throw new IllegalStateException("Re-entrant lease of " + key + " in pool " + root.name());
         if (slot == null || !slot.scope.isActive()) slot = create(key);
-        else if (slot.value == null) throw new IllegalStateException("Re-entrant lease of " + key + " in pool " + root.name());
         slot.release = Task.cancel(slot.release);
         slot.refs++;
         var lease = new Lease<V>(this, key, slot, (V) slot.value);
-        borrower.onDispose(lease::release);
+        borrower.undo(lease::release);
         return lease;
     }
 
     private Pooled create(K key) {
-        Pooled slot = new Pooled(root.labeled(key));
+        Pooled slot = new Pooled(root.inner(key));
         boolean kept = root.isActive();
-        if (kept) slots.put(key, slot);
+        slots.put(key, slot);
         try {
             slot.value = Objects.requireNonNull(factory.create(slot, key), "pooled value");
         } catch (Throwable t) {
-            if (kept) slots.remove(key, slot);
+            slots.remove(key, slot);
             slot.scope.end();
             throw t;
         }
+        if (!kept) slots.remove(key, slot);
         return slot;
     }
 
@@ -92,14 +94,14 @@ public final class SharedPool<K, V> {
 
     public static final class Pooled {
 
-        private final OwnedScope scope;
+        private final Scope scope;
         private final Signal demand = new Signal();
         private @Nullable Object value;
         private @Nullable Task release;
         private int refs;
         private int demands;
 
-        private Pooled(OwnedScope scope) {
+        private Pooled(Scope scope) {
             this.scope = scope;
         }
 

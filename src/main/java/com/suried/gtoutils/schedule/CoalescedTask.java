@@ -21,6 +21,7 @@ public final class CoalescedTask {
     private final @Nullable Object owner;
     private final Runnable action;
     volatile TickScheduler.Entry entry;
+    boolean lagging;
     @SuppressWarnings("unused")
     private volatile @Nullable TickScheduler queuedIn;
 
@@ -48,6 +49,10 @@ public final class CoalescedTask {
         QUEUED.compareAndSet(this, s, null);
     }
 
+    void retire() {
+        entry.cancel();
+    }
+
     void submitTo(TickScheduler scheduler, int delay) {
         while (true) {
             TickScheduler current = queuedIn();
@@ -63,8 +68,8 @@ public final class CoalescedTask {
         return (TickScheduler) QUEUED.getVolatile(this);
     }
 
-    void dequeue(TickScheduler scheduler) {
-        QUEUED.compareAndSet(this, scheduler, null);
+    boolean dequeue(TickScheduler scheduler) {
+        return QUEUED.compareAndSet(this, scheduler, null);
     }
 
     TickScheduler.Entry entryForLink(TickScheduler scheduler) {

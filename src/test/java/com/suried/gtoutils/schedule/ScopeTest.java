@@ -184,7 +184,7 @@ class ScopeTest {
         signal.emit();
         assertEquals(List.of("mount true"), log);
         lane.runRound();
-        assertEquals(List.of("mount true", "mount false", "unmount true"), log);
+        assertEquals(List.of("mount true", "unmount true", "mount false"), log);
         root.dispose();
         assertEquals("unmount false", log.get(log.size() - 1));
         assertEquals(0, signal.subscriberCount());
@@ -296,7 +296,7 @@ class ScopeTest {
     }
 
     @Test
-    void eachReconcilesByKeyAndValueCreatingBeforeDisposing() {
+    void eachReconcilesByKeyAndValueEndingBeforeCreating() {
         var lane = lane();
         var root = OwnedScope.root("root", lane);
         var signal = new Signal();
@@ -318,7 +318,7 @@ class ScopeTest {
         table.put("c", 1);
         signal.emit();
         lane.runRound();
-        assertEquals(List.of("+a2", "+c1", "-a1", "-b1"), log);
+        assertEquals(List.of("-a1", "-b1", "+a2", "+c1"), log);
         log.clear();
         signal.emit();
         lane.runRound();
@@ -362,7 +362,7 @@ class ScopeTest {
         int during = evaluations.get();
         assertTrue(during >= 3 && during <= 5, "evaluations " + during);
         root.dispose();
-        assertEquals(0, Poll.signal(lane, 3).subscriberCount());
+        assertEquals(0, Poll.signal(lane, 3, 0).subscriberCount());
         for (int i = 0; i < 9; i++) lane.runRound();
         assertEquals(during, evaluations.get());
     }
@@ -470,11 +470,11 @@ class ScopeTest {
     }
 
     @Test
-    void handoverInsideSelectDoesNotRecreatePooledResource() {
+    void handoverInsideSelectKeepsPooledResourceWithinGrace() {
         var lane = lane();
         var root = OwnedScope.root("root", lane);
         AtomicInteger created = new AtomicInteger();
-        var pool = root.<String, Object>pool("pool", 0, (p, key) -> {
+        var pool = root.<String, Object>pool("pool", 1, (p, key) -> {
             created.incrementAndGet();
             return new Object();
         });
@@ -489,6 +489,490 @@ class ScopeTest {
         lane.runRound();
         assertEquals(1, created.get());
         assertEquals(1, pool.size());
+    }
+
+    @Test
+    void chainedDerivationsSettleInTheSameRound() {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        var a = Cell.of(0);
+        var b = Cell.of(0);
+        var c = Cell.of(0);
+        List<Integer> seen = new ArrayList<>();
+        root.watch(a::get, v -> b.set(v * 2));
+        root.watch(b::get, v -> c.set(v + 1));
+        root.watch(c::get, seen::add);
+        root.schedule(0, () -> a.set(5));
+        lane.runRound();
+        assertEquals(List.of(1, 11), seen);
+        a.set(7);
+        assertEquals(List.of(1, 11), seen);
+        lane.runRound();
+        assertEquals(List.of(1, 11, 15), seen);
+    }
+
+    @Test
+    void derivationTriggeredSeveralTimesInOneRoundRunsOnce() {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        var signal = new Signal();
+        AtomicInteger evaluations = new AtomicInteger();
+        root.watch(() -> {
+            signal.track();
+            return evaluations.incrementAndGet();
+        }, v -> {});
+        for (int i = 0; i < 3; i++) root.schedule(0, signal::emit);
+        lane.runRound();
+        assertEquals(2, evaluations.get());
+    }
+
+    @Test
+    void cyclicDerivationsStopAtTheDepthLimitAndContinueNextRound() {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        var a = Cell.of(0);
+        var b = Cell.of(0);
+        int anomalies = Scope.anomalyCount();
+        root.watch(a::get, v -> b.set(v + 1));
+        root.watch(b::get, v -> a.set(v + 1));
+        lane.runRound();
+        int afterFirst = a.peek();
+        assertTrue(afterFirst <= 2 * (TickScheduler.SETTLE_DEPTH + 2), "one round ran " + afterFirst + " steps");
+        assertTrue(Scope.anomalyCount() > anomalies);
+        lane.runRound();
+        assertTrue(a.peek() > afterFirst && a.peek() <= afterFirst + 4, "later rounds run each derivation once: " + afterFirst + " -> " + a.peek());
+        int afterSecond = a.peek();
+        lane.runRound();
+        assertTrue(a.peek() > afterSecond && a.peek() <= afterSecond + 4, "and keep doing so: " + afterSecond + " -> " + a.peek());
+        root.dispose();
+        int stopped = a.peek();
+        lane.runRound();
+        assertEquals(stopped, a.peek());
+    }
+
+    @Test
+    void emitFromAnotherThreadIsHandedOverToTheLane() throws InterruptedException {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        var signal = new Signal();
+        var cell = Cell.of(0);
+        AtomicInteger heard = new AtomicInteger();
+        List<Thread> ranOn = new ArrayList<>();
+        root.listen(signal, () -> {
+            heard.incrementAndGet();
+            ranOn.add(Thread.currentThread());
+        });
+        root.listen(cell.changed(), heard::incrementAndGet);
+        int relayed = Scope.anomalyCount();
+        var other = new Thread(() -> {
+            signal.emit();
+            cell.set(1);
+        });
+        other.start();
+        other.join();
+        assertEquals(0, heard.get());
+        assertEquals(relayed + 2, Scope.anomalyCount());
+        lane.runRound();
+        assertEquals(2, heard.get());
+        assertEquals(List.of(Thread.currentThread()), ranOn);
+        new Signal().emit();
+    }
+
+    @Test
+    void registeringFromAnotherThreadIsRejectedAndLeavesTheScopeIntact() throws InterruptedException {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        var signal = new Signal();
+        int baseline = Scope.liveCount();
+        List<String> rejected = new ArrayList<>();
+        List<String> log = new ArrayList<>();
+        var other = new Thread(() -> {
+            try {
+                root.onDispose(() -> log.add("undo"));
+            } catch (IllegalStateException e) {
+                rejected.add("onDispose");
+            }
+            try {
+                root.child("child");
+            } catch (IllegalStateException e) {
+                rejected.add("child");
+            }
+            try {
+                root.listen(signal, () -> log.add("heard"));
+            } catch (IllegalStateException e) {
+                rejected.add("listen");
+            }
+            try {
+                root.watch(() -> 1, v -> log.add("watched"));
+            } catch (IllegalStateException e) {
+                rejected.add("watch");
+            }
+            try {
+                OwnedScope.root("stray", lane);
+            } catch (IllegalStateException e) {
+                rejected.add("root");
+            }
+        });
+        other.start();
+        other.join();
+        assertEquals(List.of("onDispose", "child", "listen", "watch", "root"), rejected);
+        assertEquals(baseline, Scope.liveCount());
+        assertEquals(0, signal.subscriberCount());
+        root.dispose();
+        assertTrue(log.isEmpty());
+    }
+
+    @Test
+    void signalCannotBeSharedByScopesOfTwoThreads() throws InterruptedException {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        var signal = new Signal();
+        root.listen(signal, () -> {});
+        List<String> rejected = new ArrayList<>();
+        var other = new Thread(() -> {
+            var theirs = new TickScheduler(true, RETHROW);
+            theirs.runRound();
+            var scope = OwnedScope.root("theirs", theirs);
+            try {
+                scope.listen(signal, () -> {});
+            } catch (IllegalStateException e) {
+                rejected.add("listen");
+            }
+            scope.dispose();
+        });
+        other.start();
+        other.join();
+        assertEquals(List.of("listen"), rejected);
+        assertEquals(1, signal.subscriberCount());
+    }
+
+    @Test
+    void disposeFromAnotherThreadHappensOnTheLane() throws InterruptedException {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        List<Thread> undoneOn = new ArrayList<>();
+        root.onDispose(() -> undoneOn.add(Thread.currentThread()));
+        var other = new Thread(root::dispose);
+        other.start();
+        other.join();
+        assertTrue(root.isActive());
+        lane.runRound();
+        assertFalse(root.isActive());
+        assertEquals(List.of(Thread.currentThread()), undoneOn);
+    }
+
+    @Test
+    void closingTheLaneEndsItsRootScopes() {
+        int baseline = Scope.liveCount();
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        var child = root.child("child");
+        var second = OwnedScope.root("second", lane);
+        List<String> log = new ArrayList<>();
+        child.onDispose(() -> log.add("child"));
+        root.onDispose(() -> log.add("root"));
+        second.onDispose(() -> log.add("second"));
+        second.dispose();
+        lane.close();
+        assertEquals(List.of("second", "child", "root"), log);
+        assertFalse(root.isActive());
+        assertFalse(child.isActive());
+        var late = OwnedScope.root("late", lane);
+        assertFalse(late.isActive());
+        late.onDispose(() -> log.add("late"));
+        assertEquals(List.of("second", "child", "root", "late"), log);
+        assertEquals(baseline, Scope.liveCount());
+    }
+
+    @Test
+    void laneClosedDuringARoundEndsItsRootsWhenTheRoundFinishes() {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        List<String> log = new ArrayList<>();
+        root.onDispose(() -> log.add("root"));
+        root.schedule(0, () -> {
+            lane.close();
+            log.add("closing");
+        });
+        lane.runRound();
+        assertEquals(List.of("closing", "root"), log);
+        assertFalse(root.isActive());
+    }
+
+    @Test
+    void failuresAreCountedAndKeptAsRecentSummaries() {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        var signal = new Signal();
+        int before = Scope.failureCount();
+        root.listen(signal, () -> {
+            throw new IllegalStateException("listener boom");
+        });
+        root.watch(() -> {
+            throw new IllegalStateException("derive boom");
+        }, v -> {});
+        root.onDispose(() -> {
+            throw new IllegalStateException("undo boom");
+        });
+        signal.emit();
+        root.dispose();
+        assertEquals(before + 3, Scope.failureCount());
+        var recent = Scope.recentFailures();
+        assertTrue(recent.size() >= 3 && recent.size() <= 32);
+        var tail = recent.subList(recent.size() - 3, recent.size());
+        assertTrue(tail.get(0).contains("derive boom") && tail.get(0).contains("root"));
+        assertTrue(tail.get(1).contains("listener boom"));
+        assertTrue(tail.get(2).contains("undo boom") && tail.get(2).startsWith("dispose action"));
+        for (int i = 0; i < 40; i++) {
+            var extra = OwnedScope.root("extra" + i, lane);
+            extra.onDispose(() -> {
+                throw new IllegalStateException("again");
+            });
+            extra.dispose();
+        }
+        assertEquals(32, Scope.recentFailures().size());
+        assertTrue(Scope.recentFailures().get(31).contains("extra39"));
+    }
+
+    @Test
+    void sizeCountsTheSubtreeAndDumpListsItWithLimits() {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        var a = root.child("a");
+        a.child("deep").child("deeper");
+        root.child("b").onDispose(() -> {});
+        root.provide(ScopeKey.<String>of("svc"), "x");
+        assertEquals(5, root.size());
+        assertEquals(3, a.size());
+        var out = new StringBuilder();
+        root.dump(out, 2);
+        assertEquals("root [4 below, 0 undo, 1 services]\n  a [2 below, 0 undo]\n    deep [1 below, 0 undo]\n  b [1 undo]\n", out.toString());
+        var wide = OwnedScope.root("wide", lane);
+        for (int i = 0; i < 30; i++) wide.child("c" + i);
+        out.setLength(0);
+        wide.dump(out, 1);
+        assertEquals(26, out.toString().split("\n").length);
+        assertTrue(out.toString().endsWith("  + 6 more\n"));
+    }
+
+    @Test
+    void endingAnAncestorFromADescendantsUndoTearsEachScopeDownOnce() {
+        int baseline = Scope.liveCount();
+        var lane = lane();
+        var parent = OwnedScope.root("parent", lane);
+        var child = parent.child("child");
+        var sibling = parent.child("sibling");
+        List<String> log = new ArrayList<>();
+        parent.onDispose(() -> log.add("parent"));
+        sibling.onDispose(() -> log.add("sibling"));
+        child.onDispose(() -> log.add("child-first"));
+        child.onDispose(parent::dispose);
+        child.onDispose(() -> log.add("child-last"));
+        int failures = Scope.failureCount();
+        child.dispose();
+        assertEquals(List.of("child-last", "sibling", "parent", "child-first"), log);
+        assertFalse(parent.isActive());
+        assertEquals(failures, Scope.failureCount());
+        assertEquals(baseline, Scope.liveCount());
+    }
+
+    @Test
+    void selectEndsTheOldChildBeforeMountingTheNewOne() {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        var cell = Cell.of("a");
+        List<String> log = new ArrayList<>();
+        root.select(cell::get, (scope, v) -> {
+            log.add("+" + v);
+            scope.onDispose(() -> log.add("-" + v));
+        });
+        cell.set("b");
+        lane.runRound();
+        assertEquals(List.of("+a", "-a", "+b"), log);
+    }
+
+    @Test
+    void selectStopsWhenEndingTheOldChildEndsItsOwner() {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        var owner = root.child("owner");
+        var cell = Cell.of("a");
+        List<String> log = new ArrayList<>();
+        owner.select(cell::get, (scope, v) -> {
+            log.add("+" + v);
+            scope.onDispose(owner::dispose);
+        });
+        cell.set("b");
+        lane.runRound();
+        assertEquals(List.of("+a"), log);
+        assertFalse(owner.isActive());
+    }
+
+    @Test
+    void siblingsEndInReverseOrderEvenAfterOneWasRemoved() {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        List<String> log = new ArrayList<>();
+        Map<String, OwnedScope> children = new HashMap<>();
+        for (var name : List.of("a", "b", "c", "d")) {
+            var child = root.child(name);
+            child.onDispose(() -> log.add(name));
+            children.put(name, child);
+        }
+        children.get("b").dispose();
+        log.clear();
+        root.child("e").onDispose(() -> log.add("e"));
+        assertEquals(5, root.size());
+        root.dispose();
+        assertEquals(List.of("e", "d", "c", "a"), log);
+    }
+
+    @Test
+    void tasksOfAnEndedScopeLeaveTheWheelWithinOneTurn() {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        root.schedule(5000, () -> {});
+        root.schedule(9000, () -> {});
+        assertEquals(2, lane.linkedCount());
+        root.dispose();
+        for (int i = 0; i < TickScheduler.WHEEL_SIZE; i++) lane.runRound();
+        assertEquals(0, lane.linkedCount());
+    }
+
+    @Test
+    void pollSpreadsDerivationsAcrossPhases() {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        int period = 4;
+        int[] evaluations = { 0 };
+        for (int i = 0; i < 8; i++) {
+            root.watch(() -> {
+                Poll.every(period);
+                return ++evaluations[0];
+            }, v -> {});
+        }
+        int[] perRound = new int[period * 2];
+        for (int r = 0; r < perRound.length; r++) {
+            int before = evaluations[0];
+            lane.runRound();
+            perRound[r] = evaluations[0] - before;
+        }
+        assertArrayEquals(new int[] { 2, 2, 2, 2, 2, 2, 2, 2 }, perRound);
+    }
+
+    @Test
+    void emittingInsideADerivationIsCountedAsMisuse() {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        var signal = new Signal();
+        root.listen(signal, () -> {});
+        int before = Scope.anomalyCount();
+        root.watch(() -> {
+            signal.emit();
+            return 0;
+        }, v -> {});
+        assertEquals(before + 1, Scope.anomalyCount());
+        signal.emit();
+        assertEquals(before + 1, Scope.anomalyCount());
+    }
+
+    @Test
+    void leaseAfterThePoolEndedStillRejectsAReentrantFactory() {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        var owner = root.child("owner");
+        @SuppressWarnings("unchecked")
+        SharedPool<String, Object>[] holder = new SharedPool[1];
+        holder[0] = owner.<String, Object>pool("pool", 0, (p, key) -> root.lease(holder[0], key).get());
+        owner.dispose();
+        assertThrows(IllegalStateException.class, () -> root.lease(holder[0], "k"));
+        assertEquals(0, holder[0].size());
+    }
+
+    @Test
+    void rootWithALazyLabelNamesItselfOnEveryDemandWithoutCachingAndDropsTheLabelWhenEnded() {
+        var lane = lane();
+        int[] rendered = { 0 };
+        Object label = new Object() {
+
+            @Override
+            public String toString() {
+                rendered[0]++;
+                return "machine at 1,2,3";
+            }
+        };
+        var root = OwnedScope.root(label, lane);
+        assertEquals(0, rendered[0]);
+        assertSame(label, root.label());
+        assertEquals(0, rendered[0]);
+        assertEquals("machine at 1,2,3", root.name());
+        assertEquals(1, rendered[0]);
+        assertEquals("machine at 1,2,3", root.name());
+        assertEquals(2, rendered[0]);
+        root.dispose();
+        assertEquals("ended", root.name());
+        assertEquals("ended", root.label());
+        assertEquals(2, rendered[0]);
+        var silent = OwnedScope.root(label, lane);
+        silent.dispose();
+        assertEquals("ended", silent.name());
+        assertEquals(2, rendered[0]);
+    }
+
+    @Test
+    void failedSubscriptionLeavesNoStraySubscriptions() throws InterruptedException {
+        var lane = lane();
+        var root = OwnedScope.root("root", lane);
+        var free = new Signal();
+        var taken = new Signal();
+        var other = new Thread(() -> {
+            var theirs = new TickScheduler(true, RETHROW);
+            theirs.runRound();
+            OwnedScope.root("theirs", theirs).listen(taken, () -> {});
+        });
+        other.start();
+        other.join();
+        int failures = Scope.failureCount();
+        int[] evaluations = { 0 };
+        root.watch(() -> {
+            evaluations[0]++;
+            free.track();
+            taken.track();
+            return 0;
+        }, v -> {});
+        assertEquals(failures + 1, Scope.failureCount());
+        assertEquals(0, free.subscriberCount());
+        assertEquals(1, taken.subscriberCount());
+        free.emit();
+        lane.runRound();
+        assertEquals(1, evaluations[0]);
+    }
+
+    @Test
+    void signalMovesToALiveLaneWhenItsFirstLaneCloses() throws InterruptedException {
+        var first = lane();
+        var second = lane();
+        var signal = new Signal();
+        AtomicInteger heard = new AtomicInteger();
+        OwnedScope.root("first", first).listen(signal, () -> {});
+        OwnedScope.root("second", second).listen(signal, heard::incrementAndGet);
+        first.close();
+        assertEquals(1, signal.subscriberCount());
+        var other = new Thread(signal::emit);
+        other.start();
+        other.join();
+        assertEquals(0, heard.get());
+        second.runRound();
+        assertEquals(1, heard.get());
+    }
+
+    @Test
+    void scopesAreRefusedOnALaneWithoutAFixedThread() {
+        int baseline = Scope.liveCount();
+        var async = new TickScheduler(false, RETHROW);
+        assertThrows(IllegalStateException.class, () -> OwnedScope.root("async", async));
+        assertFalse(OwnedScope.root("closed", TickScheduler.CLOSED).isActive());
+        assertEquals(baseline, Scope.liveCount());
     }
 
     @Test

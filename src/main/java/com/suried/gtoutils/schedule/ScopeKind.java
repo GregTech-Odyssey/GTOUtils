@@ -1,12 +1,11 @@
 package com.suried.gtoutils.schedule;
 
-import com.mojang.logging.LogUtils;
 import it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Reference2ObjectLinkedOpenHashMap;
 import org.jetbrains.annotations.Nullable;
-import org.slf4j.Logger;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.function.BiConsumer;
 
@@ -15,19 +14,18 @@ import java.util.function.BiConsumer;
  * <ul>
  * <li>{@link #byIdentity}/{@link #byEquality}：建一种作用域，拥有者按对象身份或按 equals 区分；返回的 {@link Control} 只交给负责开关的一方</li>
  * <li>{@link #install}：登记一个模块；之后建立的每个实例都会挂上它，已经存在的实例立即补挂；同名重复登记报错</li>
- * <li>每个模块挂在实例下自己的子作用域里，它用 {@link Scope#provide} 提供的服务对整个实例可见；某个模块挂载时抛异常只记日志，它已挂上的部分整个撤回，不影响其余模块</li>
- * <li>{@link #get}：拥有者当前的实例，没有时为 null；在派生里调用会随实例的建立与结束自动重算</li>
+ * <li>open 建的实例与模块的子作用域都不是 {@link OwnedScope}，拿到的一方强转后结束不了；每个模块挂在实例下自己的子作用域里，它用 {@link Scope#provide} 提供的服务对整个实例可见；某个模块挂载时抛异常记入失败记录，它已挂上的部分整个撤回，不影响其余模块；模块挂载期间读到的信号不会记成外层派生的依赖</li>
+ * <li>{@link #get}：拥有者当前的实例，没有时为 null；在派生里调用会随这个拥有者的实例建立、更换与结束自动重算，别的拥有者的实例结束不会让它重算</li>
  * <li>{@link #lookup}/{@link #require}：直接取拥有者实例上的服务；没有实例或没有该服务时，lookup 为 null，require 报错</li>
  * <li>{@link #forEach}/{@link #size}：遍历当前全部实例</li>
- * <li>{@link Control#open}：为拥有者建一个根实例，按登记顺序挂上全部模块</li>
- * <li>{@link Control#bind}：把一个已有的作用域认作拥有者的实例（例如派生里建的子作用域），它结束时自动除名</li>
- * <li>open 与 bind 都会先结束该拥有者此前由 open 建立的实例</li>
- * <li>{@link Control#close}/{@link Control#closeAll}：结束 open 建立的实例</li>
+ * <li>{@link Control#open}：为拥有者建一个根实例，按登记顺序挂上全部模块；车道已关闭时得到的是已结束的实例，不留下任何登记</li>
+ * <li>{@link Control#bind}：把一个已有的作用域认作拥有者的实例（例如派生里建的子作用域），它结束时自动除名；同一个作用域重复认领什么也不做</li>
+ * <li>一个拥有者同一时刻只有一个实例：open 与 bind 都会先结束该拥有者此前的实例，不论它是 open 建的还是 bind 认的</li>
+ * <li>{@link Control#close}/{@link Control#closeAll}：结束 open 建立的实例；closeAll 期间又被 open 出来的实例也一并结束</li>
+ * <li>同一种作用域的实例只能在同一个线程上建立，另一个线程来建立直接报错；在派生函数里建立实例记一次误用</li>
  * </ul>
  */
 public final class ScopeKind<T> {
-
-    private static final Logger LOGGER = LogUtils.getLogger();
 
     @FunctionalInterface
     public interface Module<T> {
@@ -37,11 +35,21 @@ public final class ScopeKind<T> {
 
     private record Installed<T>(String id, Module<? super T> module) {}
 
+    private record Label(String kind, Object owner) {
+
+        @Override
+        public String toString() {
+            return kind + " " + owner;
+        }
+    }
+
     private final String name;
     private final Map<T, Scope> live;
-    private final Map<T, OwnedScope> roots;
-    private final ArrayList<Installed<T>> modules = new ArrayList<>();
-    private final Signal changed = new Signal();
+    private final Map<T, Scope> roots;
+    private final Signal arrived = new Signal();
+    @SuppressWarnings("unchecked")
+    private Installed<T>[] modules = new Installed[0];
+    private @Nullable Thread home;
 
     private ScopeKind(String name, boolean identity) {
         this.name = name;
@@ -64,7 +72,9 @@ public final class ScopeKind<T> {
     public void install(String id, Module<? super T> module) {
         for (var m : modules) if (m.id.equals(id)) throw new IllegalStateException("Module " + id + " already installed on scope kind " + name);
         var installed = new Installed<T>(id, module);
-        modules.add(installed);
+        var grown = Arrays.copyOf(modules, modules.length + 1);
+        grown[modules.length] = installed;
+        modules = grown;
         if (live.isEmpty()) return;
         for (var owner : new ArrayList<>(live.keySet())) {
             var scope = live.get(owner);
@@ -74,8 +84,10 @@ public final class ScopeKind<T> {
 
     @Nullable
     public Scope get(T owner) {
-        changed.track();
-        return live.get(owner);
+        Scope scope = live.get(owner);
+        if (scope != null) scope.trackInstance();
+        else arrived.track();
+        return scope;
     }
 
     @Nullable
@@ -108,26 +120,36 @@ public final class ScopeKind<T> {
 
     private void mountSafely(Installed<T> installed, Scope scope, T owner) {
         if (!scope.isActive()) return;
-        OwnedScope room = scope.child(installed.id);
+        Scope room = scope.inner(installed.id);
+        Signal.Frame muted = Signal.mute();
         try {
             installed.module.mount(room, owner);
         } catch (Throwable t) {
-            LOGGER.error("GTOUtils: module {} failed to mount on {} {}", installed.id, name, owner, t);
-            room.dispose();
+            Scope.fail("module " + installed.id + " mount", room, t);
+            room.end();
+        } finally {
+            Signal.unmute(muted);
         }
+    }
+
+    private void enter() {
+        Thread thread = Thread.currentThread();
+        if (live.isEmpty()) home = thread;
+        else if (home != thread) throw new IllegalStateException("Scope kind " + name + " is used from thread " + thread.getName() + " while its instances live on another thread");
+        if (Signal.tracking()) Scope.anomaly("scope instance opened inside a derivation function", name);
     }
 
     private void attach(T owner, Scope scope) {
         scope.markAnchor();
-        live.put(owner, scope);
-        scope.onDispose(() -> {
-            if (live.get(owner) == scope) {
-                live.remove(owner);
-                changed.emit();
-            }
+        Scope previous = live.put(owner, scope);
+        scope.undo(() -> {
+            if (live.get(owner) == scope) live.remove(owner);
+            if (roots.get(owner) == scope) roots.remove(owner);
         });
-        changed.emit();
-        for (var installed : new ArrayList<>(modules)) mountSafely(installed, scope, owner);
+        if (previous == null) arrived.emit();
+        else if (previous != scope) previous.end();
+        Installed<T>[] mounting = modules;
+        for (var installed : mounting) mountSafely(installed, scope, owner);
     }
 
     public static final class Control<T> {
@@ -143,27 +165,36 @@ public final class ScopeKind<T> {
         }
 
         public Scope open(T owner, TickScheduler lane) {
+            kind.enter();
+            lane.claim();
             close(owner);
-            var root = OwnedScope.root(kind.name + " " + owner, lane);
-            kind.roots.put(owner, root);
+            var root = Scope.innerRoot(new Label(kind.name, owner), lane);
+            Scope reentered = kind.roots.put(owner, root);
+            if (reentered != null) reentered.end();
             kind.attach(owner, root);
             return root;
         }
 
         public void bind(T owner, Scope scope) {
-            if (!scope.isActive()) return;
+            if (!scope.isActive() || kind.live.get(owner) == scope) return;
+            scope.guard();
+            kind.enter();
             close(owner);
             kind.attach(owner, scope);
         }
 
         public void close(T owner) {
             var root = kind.roots.remove(owner);
-            if (root != null) root.dispose();
+            if (root != null) root.end();
         }
 
         public void closeAll() {
-            for (var root : new ArrayList<>(kind.roots.values())) root.dispose();
-            kind.roots.clear();
+            for (int budget = kind.roots.size() + 16; budget > 0 && !kind.roots.isEmpty(); budget--) {
+                var first = kind.roots.values().iterator();
+                Scope root = first.next();
+                first.remove();
+                root.end();
+            }
         }
     }
 }

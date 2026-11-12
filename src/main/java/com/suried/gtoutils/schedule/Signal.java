@@ -1,25 +1,25 @@
 package com.suried.gtoutils.schedule;
 
-import com.mojang.logging.LogUtils;
 import org.jetbrains.annotations.Nullable;
-import org.slf4j.Logger;
 
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * 无载荷的依赖信号，作用域派生（{@link Scope#select}、{@link Scope#when}、{@link Scope#each}）据此自动重算。功能：
+ * 无载荷的依赖信号，作用域派生（{@link Scope#watch}、{@link Scope#select}、{@link Scope#when}、{@link Scope#each}）据此自动重算。功能：
  * <ul>
  * <li>{@link #track}：在派生函数求值期间调用时，把本信号记为该派生的依赖；不在求值期间调用时什么也不做，开销是一次原子读；求值用的记录按线程复用，重算不分配</li>
- * <li>{@link #emit}：依赖本信号的派生标脏，合并到其车道的下一轮重算；经 {@link Scope#listen} 挂上的监听立即同步执行；没有订阅时直接返回</li>
- * <li>某个订阅抛异常只记日志，不影响其余订阅，也不会抛给触发方</li>
+ * <li>{@link #emit}：依赖本信号的派生标脏并合并重算，在车道的一轮里触发的当轮就重算；经 {@link Scope#listen} 挂上的监听立即同步执行；没有订阅时直接返回</li>
+ * <li>在订阅方车道以外的线程上触发：不在那个线程上分发，转投到订阅方的车道、下一轮开头再触发，并在首次发生时带调用栈告警；转投用的车道关闭后，改用仍有订阅的另一条车道</li>
+ * <li>同一个信号只能被同一个线程上的作用域订阅，另一个线程来订阅直接报错</li>
+ * <li>在派生函数求值期间触发信号属于误用：照常分发，记一次异常并在首次发生时带调用栈告警</li>
+ * <li>某个订阅抛异常只记入失败记录，不影响其余订阅，也不会抛给触发方</li>
  * <li>分发期间新增的订阅本次不执行，移除的订阅本次不再执行；订阅的增删都是 O(1)</li>
  * <li>{@link #subscriberCount}：当前订阅数</li>
  * </ul>
  */
-public sealed class Signal permits Poll.PollSignal {
+public sealed class Signal permits Poll.PollSignal, KeyedSignal.Slot, Cell.Changed {
 
-    private static final Logger LOGGER = LogUtils.getLogger();
     private static final AtomicInteger FRAMES = new AtomicInteger();
     private static final ThreadLocal<Tracker> TRACKERS = new ThreadLocal<>();
     private static final Sub[] NONE = new Sub[0];
@@ -29,6 +29,7 @@ public sealed class Signal permits Poll.PollSignal {
     private int live;
     private int dispatching;
     private boolean holes;
+    private volatile @Nullable TickScheduler home;
 
     public final void track() {
         if (FRAMES.get() == 0) return;
@@ -37,8 +38,14 @@ public sealed class Signal permits Poll.PollSignal {
     }
 
     public final void emit() {
+        TickScheduler lane = home;
+        if (lane == null) return;
+        if (lane.foreign()) {
+            relay(lane);
+            return;
+        }
+        if (FRAMES.get() != 0 && currentFrame() != null) Scope.anomaly("signal emitted inside a derivation function", null);
         int n = size;
-        if (n == 0) return;
         dispatching++;
         try {
             for (int i = 0; i < n; i++) {
@@ -50,11 +57,17 @@ public sealed class Signal permits Poll.PollSignal {
         }
     }
 
-    private static void deliver(Runnable action) {
+    private void relay(TickScheduler lane) {
+        Scope.anomaly("signal emitted off its lane thread", null);
+        lane.schedule(0, null, this::emit);
+    }
+
+    private static void deliver(Object action) {
         try {
-            action.run();
+            if (action instanceof Scope.Hook hook) hook.fire();
+            else ((Runnable) action).run();
         } catch (Throwable t) {
-            LOGGER.error("GTOUtils: signal subscriber failed", t);
+            Scope.fail("signal subscriber", null, t);
         }
     }
 
@@ -62,13 +75,23 @@ public sealed class Signal permits Poll.PollSignal {
         return live;
     }
 
+    @Nullable
+    final TickScheduler home() {
+        return home;
+    }
+
     void firstSubscribed() {}
 
     void lastUnsubscribed() {}
 
-    final Sub subscribe(Runnable action) {
-        Sub s = new Sub(this, action);
-        if (size == subs.length) subs = Arrays.copyOf(subs, Math.max(4, size * 2));
+    void unclaimed() {}
+
+    final Sub subscribe(TickScheduler lane, Object action) {
+        TickScheduler current = home;
+        if (current == null || current.isClosed()) home = lane;
+        else if (current.foreign()) throw new IllegalStateException("Signal is already subscribed from another thread");
+        Sub s = new Sub(this, lane, action);
+        if (size == subs.length) subs = Arrays.copyOf(subs, Math.max(2, size * 2));
         s.index = size;
         subs[size++] = s;
         if (live++ == 0) firstSubscribed();
@@ -89,8 +112,24 @@ public sealed class Signal permits Poll.PollSignal {
                 subs[s.index] = moved;
                 moved.index = s.index;
             }
+            if (last < subs.length >> 2 && subs.length > 16) subs = Arrays.copyOf(subs, subs.length >> 1);
         }
-        if (--live == 0) lastUnsubscribed();
+        if (--live == 0) {
+            home = null;
+            lastUnsubscribed();
+            return;
+        }
+        TickScheduler lane = home;
+        if (lane != null && lane.isClosed()) rehome();
+    }
+
+    private void rehome() {
+        for (int i = 0; i < size; i++) {
+            Sub s = subs[i];
+            if (s == null || !s.live || s.lane.isClosed()) continue;
+            home = s.lane;
+            return;
+        }
     }
 
     private void compact() {
@@ -106,18 +145,25 @@ public sealed class Signal permits Poll.PollSignal {
         size = j;
     }
 
+    static boolean tracking() {
+        return currentFrame() != null;
+    }
+
     @Nullable
     static Frame currentFrame() {
         if (FRAMES.get() == 0) return null;
         Tracker tracker = TRACKERS.get();
-        return tracker == null || tracker.depth == 0 ? null : tracker.frames[tracker.depth - 1];
+        if (tracker == null || tracker.depth == 0) return null;
+        Frame frame = tracker.frames[tracker.depth - 1];
+        return frame.muted ? null : frame;
     }
 
-    static Frame enter(TickScheduler lane) {
+    static Frame enter(TickScheduler lane, int salt) {
         Tracker tracker = TRACKERS.get();
         if (tracker == null) TRACKERS.set(tracker = new Tracker());
         Frame frame = tracker.push();
         frame.lane = lane;
+        frame.salt = salt;
         FRAMES.incrementAndGet();
         return frame;
     }
@@ -127,7 +173,23 @@ public sealed class Signal permits Poll.PollSignal {
         Arrays.fill(frame.deps, 0, frame.count, null);
         frame.count = 0;
         frame.lane = null;
+        frame.muted = false;
         frame.tracker.depth--;
+    }
+
+    @Nullable
+    static Frame mute() {
+        if (FRAMES.get() == 0) return null;
+        Tracker tracker = TRACKERS.get();
+        if (tracker == null || tracker.depth == 0) return null;
+        Frame frame = tracker.push();
+        frame.muted = true;
+        FRAMES.incrementAndGet();
+        return frame;
+    }
+
+    static void unmute(@Nullable Frame frame) {
+        if (frame != null) exit(frame);
     }
 
     private static final class Tracker {
@@ -147,12 +209,14 @@ public sealed class Signal permits Poll.PollSignal {
     static final class Sub {
 
         final Signal signal;
-        final Runnable action;
+        final TickScheduler lane;
+        final Object action;
         int index;
         boolean live = true;
 
-        Sub(Signal signal, Runnable action) {
+        Sub(Signal signal, TickScheduler lane, Object action) {
             this.signal = signal;
+            this.lane = lane;
             this.action = action;
         }
 
@@ -167,12 +231,15 @@ public sealed class Signal permits Poll.PollSignal {
         TickScheduler lane;
         Signal[] deps = new Signal[4];
         int count;
+        int salt;
+        boolean muted;
 
         Frame(Tracker tracker) {
             this.tracker = tracker;
         }
 
         void add(Signal signal) {
+            if (muted) return;
             for (int i = 0; i < count; i++) if (deps[i] == signal) return;
             if (count == deps.length) deps = Arrays.copyOf(deps, count * 2);
             deps[count++] = signal;

@@ -95,9 +95,7 @@ class ScopeKindTest {
         assertSame(first, control.kind().get("steve"));
         var second = parent.child("second");
         control.bind("steve", second);
-        assertTrue(first.isActive());
-        assertSame(second, control.kind().get("steve"));
-        first.dispose();
+        assertFalse(first.isActive());
         assertSame(second, control.kind().get("steve"));
         parent.dispose();
         assertNull(control.kind().get("steve"));
@@ -253,6 +251,262 @@ class ScopeKindTest {
         root.dispose();
         root.provide(key, "x");
         assertNull(root.lookup(key));
+    }
+
+    @Test
+    void getReevaluatesOnlyForItsOwnOwner() {
+        var lane = lane();
+        var control = ScopeKind.<String>byEquality("player");
+        var watcher = OwnedScope.root("watcher", lane);
+        control.open("steve", lane);
+        control.open("alex", lane);
+        int[] evaluations = { 0 };
+        List<Boolean> seen = new ArrayList<>();
+        watcher.watch(() -> {
+            evaluations[0]++;
+            return control.kind().get("steve") != null;
+        }, seen::add);
+        control.close("alex");
+        control.open("alex", lane);
+        lane.runRound();
+        assertEquals(1, evaluations[0]);
+        var replaced = control.open("steve", lane);
+        lane.runRound();
+        assertEquals(2, evaluations[0]);
+        assertEquals(List.of(true), seen);
+        var parent = OwnedScope.root("parent", lane);
+        control.bind("steve", parent.child("bound"));
+        assertFalse(replaced.isActive());
+        lane.runRound();
+        assertEquals(3, evaluations[0]);
+        parent.dispose();
+        lane.runRound();
+        assertEquals(List.of(true, false), seen);
+        control.open("alex2", lane);
+        lane.runRound();
+        assertEquals(5, evaluations[0]);
+        control.closeAll();
+    }
+
+    @Test
+    void lookupReevaluatesOnlyForInstancesOnItsPath() {
+        var lane = lane();
+        var key = ScopeKey.<Integer>of("count");
+        var control = ScopeKind.<String>byEquality("player");
+        var steve = control.open("steve", lane);
+        var alex = control.open("alex", lane);
+        int[] evaluations = { 0 };
+        List<Integer> seen = new ArrayList<>();
+        steve.child("module").watch(() -> {
+            evaluations[0]++;
+            Integer v = control.kind().lookup("steve", key);
+            return v == null ? -1 : v;
+        }, seen::add);
+        var theirs = alex.child("provider");
+        theirs.provide(key, 9);
+        theirs.dispose();
+        lane.runRound();
+        assertEquals(1, evaluations[0]);
+        var mine = steve.child("provider");
+        mine.provide(key, 4);
+        lane.runRound();
+        mine.dispose();
+        lane.runRound();
+        assertEquals(List.of(-1, 4, -1), seen);
+        assertEquals(3, evaluations[0]);
+        control.closeAll();
+    }
+
+    @Test
+    void lookupFollowsAScopeThatBecomesAnInstanceLater() {
+        var lane = lane();
+        var key = ScopeKey.<String>of("svc");
+        var control = ScopeKind.<String>byEquality("screen");
+        var root = OwnedScope.root("level", lane);
+        var screen = root.child("screen");
+        var inner = screen.child("inner");
+        List<String> seen = new ArrayList<>();
+        inner.watch(() -> String.valueOf(inner.lookup(key)), seen::add);
+        control.bind("s", screen);
+        screen.child("panel").provide(key, "panel");
+        lane.runRound();
+        assertEquals(List.of("null", "panel"), seen);
+        assertNull(root.lookup(key));
+        root.dispose();
+        assertEquals(0, control.kind().size());
+    }
+
+    @Test
+    void laneCloseForgetsInstancesOpenedOnIt() {
+        var lane = lane();
+        var control = ScopeKind.<String>byEquality("player");
+        List<String> log = new ArrayList<>();
+        control.kind().install("m", (scope, owner) -> scope.onDispose(() -> log.add("end " + owner)));
+        control.open("steve", lane);
+        lane.close();
+        assertEquals(List.of("end steve"), log);
+        assertNull(control.kind().get("steve"));
+        assertEquals(0, control.kind().size());
+        var fresh = lane();
+        var reopened = control.open("steve", fresh);
+        assertTrue(reopened.isActive());
+        assertEquals(List.of("end steve"), log);
+        control.closeAll();
+        assertEquals(List.of("end steve", "end steve"), log);
+    }
+
+    @Test
+    void bindingTheSameScopeTwiceMountsOnceAndANewBindEndsTheOldInstance() {
+        var lane = lane();
+        var control = ScopeKind.<String>byEquality("screen");
+        AtomicInteger mounts = new AtomicInteger();
+        control.kind().install("m", (scope, owner) -> mounts.incrementAndGet());
+        var parent = OwnedScope.root("parent", lane);
+        var first = parent.child("first");
+        control.bind("s", first);
+        control.bind("s", first);
+        assertEquals(1, mounts.get());
+        var second = parent.child("second");
+        control.bind("s", second);
+        assertFalse(first.isActive());
+        assertSame(second, control.kind().get("s"));
+        assertEquals(2, mounts.get());
+        var opened = control.open("s", lane);
+        assertFalse(second.isActive());
+        assertSame(opened, control.kind().get("s"));
+        assertEquals(1, control.kind().size());
+        control.closeAll();
+        parent.dispose();
+    }
+
+    @Test
+    void closeAllAlsoEndsInstancesReopenedWhileClosing() {
+        var lane = lane();
+        var control = ScopeKind.<String>byEquality("level");
+        boolean[] reopened = { false };
+        control.kind().install("reopen", (scope, owner) -> scope.onDispose(() -> {
+            if (!owner.equals("a") || reopened[0]) return;
+            reopened[0] = true;
+            control.open("late", lane);
+        }));
+        control.open("a", lane);
+        control.open("b", lane);
+        control.closeAll();
+        assertTrue(reopened[0]);
+        assertEquals(0, control.kind().size());
+        assertNull(control.kind().get("late"));
+    }
+
+    @Test
+    void reopeningTheSameOwnerWhileItsOldInstanceEndsLeavesOneInstance() {
+        var lane = lane();
+        var control = ScopeKind.<String>byEquality("level");
+        boolean[] reentered = { false };
+        AtomicInteger alive = new AtomicInteger();
+        control.kind().install("count", (scope, owner) -> scope.effect(alive::incrementAndGet, alive::decrementAndGet));
+        control.kind().install("reenter", (scope, owner) -> scope.onDispose(() -> {
+            if (reentered[0]) return;
+            reentered[0] = true;
+            control.open(owner, lane);
+        }));
+        control.open("a", lane);
+        control.open("a", lane);
+        assertTrue(reentered[0]);
+        assertEquals(1, control.kind().size());
+        assertEquals(1, alive.get());
+        control.closeAll();
+        assertEquals(0, alive.get());
+    }
+
+    @Test
+    void kindRejectsInstancesFromASecondThread() throws InterruptedException {
+        var lane = lane();
+        var control = ScopeKind.<String>byEquality("player");
+        control.open("a", lane);
+        List<String> rejected = new ArrayList<>();
+        var other = new Thread(() -> {
+            var theirs = new TickScheduler(true, RETHROW);
+            theirs.runRound();
+            try {
+                control.open("b", theirs);
+            } catch (IllegalStateException e) {
+                rejected.add("open");
+            }
+        });
+        other.start();
+        other.join();
+        assertEquals(List.of("open"), rejected);
+        assertEquals(1, control.kind().size());
+        control.closeAll();
+    }
+
+    @Test
+    void moduleMountDoesNotLeakDependenciesIntoAnOuterDerivation() {
+        var lane = lane();
+        var control = ScopeKind.<String>byEquality("level");
+        var cell = Cell.of(0);
+        control.kind().install("reader", (scope, owner) -> cell.get());
+        var watcher = OwnedScope.root("watcher", lane);
+        int[] evaluations = { 0 };
+        int anomalies = Scope.anomalyCount();
+        watcher.watch(() -> {
+            evaluations[0]++;
+            if (control.kind().get("x") == null) control.open("x", lane);
+            return 0;
+        }, v -> {});
+        assertEquals(anomalies + 1, Scope.anomalyCount());
+        cell.set(1);
+        lane.runRound();
+        assertEquals(1, evaluations[0]);
+        control.closeAll();
+    }
+
+    @Test
+    void openOnAClosedLaneLeavesNothingBehind() {
+        var lane = lane();
+        lane.close();
+        var control = ScopeKind.<String>byEquality("level");
+        AtomicInteger mounts = new AtomicInteger();
+        control.kind().install("m", (scope, owner) -> mounts.incrementAndGet());
+        var scope = control.open("x", lane);
+        assertFalse(scope.isActive());
+        assertNull(control.kind().get("x"));
+        assertEquals(0, control.kind().size());
+        assertEquals(0, mounts.get());
+    }
+
+    @Test
+    void bindingAFreshScopeDoesNotDisturbLookupsOnTheParentInstance() {
+        var lane = lane();
+        var key = ScopeKey.<String>of("svc");
+        var control = ScopeKind.<String>byEquality("presence");
+        var root = OwnedScope.root("player", lane);
+        int[] evaluations = { 0 };
+        root.child("module").watch(() -> {
+            evaluations[0]++;
+            return String.valueOf(root.lookup(key));
+        }, v -> {});
+        control.bind("p", root.child("fresh"));
+        lane.runRound();
+        assertEquals(1, evaluations[0]);
+        root.dispose();
+    }
+
+    @Test
+    void bindRefusesAScopeFromAnotherThreadWithoutLeavingAnEntry() throws InterruptedException {
+        lane();
+        var control = ScopeKind.<String>byEquality("screen");
+        OwnedScope[] foreign = new OwnedScope[1];
+        var other = new Thread(() -> {
+            var theirs = new TickScheduler(true, RETHROW);
+            theirs.runRound();
+            foreign[0] = OwnedScope.root("theirs", theirs);
+        });
+        other.start();
+        other.join();
+        assertThrows(IllegalStateException.class, () -> control.bind("s", foreign[0]));
+        assertEquals(0, control.kind().size());
+        assertNull(control.kind().get("s"));
     }
 
     @Test

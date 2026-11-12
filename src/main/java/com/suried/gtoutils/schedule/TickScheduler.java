@@ -4,6 +4,7 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.block.entity.BlockEntity;
 
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import org.jetbrains.annotations.Nullable;
 
 import java.lang.invoke.MethodHandles;
@@ -23,7 +24,10 @@ import java.util.function.Predicate;
  * <li>{@link Task#setPeriod}：改周期，在该任务下一次执行之后生效</li>
  * <li>任何线程都能提交和取消：在调度线程上直接挂入，其它线程经收件箱在下一轮开头并入；任务只在调度线程上执行</li>
  * <li>{@link #runRound}：推进一轮，只访问本轮到期的条目；周期任务按周期分组、组内按相位分桶，条目常驻不动；一次性任务与超长周期走 256 槽时间轮</li>
- * <li>{@link #close}：关闭后已排的任务全部失效，之后提交的直接是已取消状态；任务抛出的异常交给构造时给的处理器</li>
+ * <li>{@link #close}：关闭后已排的任务全部失效，之后提交的直接是已取消状态，挂在本车道上的无父作用域全部结束；任务抛出的异常交给构造时给的处理器；在车道线程以外、又不在一轮里关闭时记一次误用，作用域的清理推迟到车道线程下一次推进时执行，之后再也不推进的车道上，这些作用域不会结束</li>
+ * <li>{@link #foreign}：当前线程是否不是驱动本车道的线程；车道还没被任何线程认领时对所有线程都为假；{@link Schedulers} 建维度与全局车道时就认领服务端或客户端主线程</li>
+ * <li>所有者是作用域的任务在作用域结束后最多留在时间轮里 256 轮就被摘掉，周期任务最多留一个周期</li>
+ * <li>{@link #forEachScope}：遍历挂在本车道上的无父作用域，只在调度线程上调用</li>
  * </ul>
  */
 public final class TickScheduler {
@@ -36,6 +40,8 @@ public final class TickScheduler {
 
     static final int WHEEL_SIZE = 256;
     static final int MAX_GROUP_PERIOD = 4096;
+    static final int SETTLE_DEPTH = 16;
+    static final int SETTLE = -2;
     private static final int WHEEL_MASK = WHEEL_SIZE - 1;
 
     private static final byte ONCE = 0;
@@ -45,17 +51,22 @@ public final class TickScheduler {
     private static final byte OWNER_BLOCK_ENTITY = 1;
     private static final byte OWNER_ENTITY = 2;
     private static final byte OWNER_SCOPE = 3;
+    private static final Scope[] NO_ROOTS = new Scope[0];
+    private static final String SPILLED = "derivations re-triggered each other more than " + SETTLE_DEPTH + " times in one round";
+    private static final String CLOSED_OFF_LANE = "lane closed off its lane thread outside a round; its scopes end when the lane thread next drives it";
 
     static final TickScheduler CLOSED = closedScheduler();
 
     private final boolean sticky;
     private final FailureHandler failures;
-    private @Nullable Thread affinity;
+    private volatile @Nullable Thread affinity;
     private volatile @Nullable Thread roundThread;
     private volatile long round;
     private volatile boolean closed;
+    private volatile boolean cleared;
     private int linked;
     private boolean inRound;
+    private int depth;
     private long largeCursor;
 
     private final Entry[] wheelHead = new Entry[WHEEL_SIZE];
@@ -65,7 +76,10 @@ public final class TickScheduler {
     private final Object inboxLock = new Object();
     private @Nullable Entry inboxHead;
     private @Nullable Entry inboxTail;
-    private @Nullable Int2ObjectOpenHashMap<Poll.PollSignal> polls;
+    private @Nullable Long2ObjectOpenHashMap<Poll.PollSignal> polls;
+    private int salts;
+    private Scope[] roots = NO_ROOTS;
+    private int rootCount;
 
     TickScheduler(boolean sticky, FailureHandler failures) {
         this.sticky = sticky;
@@ -131,6 +145,19 @@ public final class TickScheduler {
         task.submitTo(this, Math.max(0, delay));
     }
 
+    void settle(CoalescedTask task) {
+        task.submitTo(this, SETTLE);
+    }
+
+    boolean sticky() {
+        return sticky;
+    }
+
+    public boolean foreign() {
+        Thread driver = sticky ? affinity : roundThread;
+        return driver != null && driver != Thread.currentThread();
+    }
+
     public long round() {
         return round;
     }
@@ -141,13 +168,22 @@ public final class TickScheduler {
 
     public void close() {
         closed = true;
-        if (!inRound && sticky && (affinity == null || affinity == Thread.currentThread())) clear();
+        if (!sticky || inRound && onDriverThread()) return;
+        Thread driver = affinity;
+        if (driver == null || driver == Thread.currentThread()) {
+            clear();
+            return;
+        }
+        if (roundThread == null && !cleared) Scope.anomaly(CLOSED_OFF_LANE, this);
     }
 
     void runRound() {
-        if (closed) return;
+        if (closed) {
+            if (!cleared) clear();
+            return;
+        }
         Thread t = Thread.currentThread();
-        if (sticky && affinity == null) affinity = t;
+        if (sticky && affinity != t) affinity = t;
         roundThread = t;
         inRound = true;
         long r = round + 1;
@@ -162,6 +198,7 @@ public final class TickScheduler {
             if (!closed) runWheel((int) (r & WHEEL_MASK), r);
         } finally {
             inRound = false;
+            depth = 0;
             roundThread = null;
             if (closed) clear();
         }
@@ -186,6 +223,7 @@ public final class TickScheduler {
     }
 
     void clear() {
+        cleared = true;
         Arrays.fill(wheelHead, null);
         Arrays.fill(wheelTail, null);
         groups = new Group[0];
@@ -195,15 +233,64 @@ public final class TickScheduler {
             inboxTail = null;
         }
         linked = 0;
+        polls = null;
+        Scope[] ending = roots;
+        int n = rootCount;
+        roots = NO_ROOTS;
+        rootCount = 0;
+        for (int i = n - 1; i >= 0; i--) {
+            ending[i].slot = -1;
+            ending[i].end();
+        }
     }
 
-    Poll.PollSignal poll(int period) {
-        if (closed) return new Poll.PollSignal(this, period);
+    boolean adopt(Scope root) {
+        if (closed) return false;
+        if (rootCount == roots.length) roots = Arrays.copyOf(roots, Math.max(4, rootCount * 2));
+        root.slot = rootCount;
+        roots[rootCount++] = root;
+        return true;
+    }
+
+    void release(Scope root) {
+        int i = root.slot;
+        if (i < 0 || i >= rootCount || roots[i] != root) return;
+        int last = --rootCount;
+        Scope moved = roots[last];
+        roots[last] = null;
+        if (moved != root) {
+            roots[i] = moved;
+            moved.slot = i;
+        }
+        root.slot = -1;
+        if (last < roots.length >> 2 && roots.length > 64) roots = Arrays.copyOf(roots, roots.length >> 1);
+    }
+
+    Poll.PollSignal poll(int period, int phase) {
+        if (closed) return new Poll.PollSignal(this, period, phase);
         var signals = polls;
-        if (signals == null) polls = signals = new Int2ObjectOpenHashMap<>();
-        var signal = signals.get(period);
-        if (signal == null) signals.put(period, signal = new Poll.PollSignal(this, period));
+        if (signals == null) polls = signals = new Long2ObjectOpenHashMap<>();
+        long key = (long) period << 32 | phase;
+        var signal = signals.get(key);
+        if (signal == null) signals.put(key, signal = new Poll.PollSignal(this, period, phase));
         return signal;
+    }
+
+    int nextSalt() {
+        return salts++;
+    }
+
+    void claim() {
+        claim(Thread.currentThread());
+    }
+
+    void claim(Thread thread) {
+        if (sticky && affinity == null) affinity = thread;
+    }
+
+    public void forEachScope(Consumer<? super Scope> action) {
+        Scope[] snapshot = Arrays.copyOf(roots, rootCount);
+        for (Scope root : snapshot) action.accept(root);
     }
 
     int linkedCount() {
@@ -233,22 +320,37 @@ public final class TickScheduler {
 
     private void pushInbox(Entry e) {
         synchronized (inboxLock) {
-            e.next = null;
+            e.inboxNext = null;
             if (inboxTail == null) inboxHead = e;
-            else inboxTail.next = e;
+            else inboxTail.inboxNext = e;
             inboxTail = e;
         }
     }
 
     void enqueueCoalesced(CoalescedTask task, int delay) {
+        boolean settle = delay == SETTLE;
         if (onDriverThread()) {
             Entry e = task.entryForLink(this);
-            e.delay = delay;
+            e.delay = settle ? 0 : delay;
+            int hop = depth + 1;
+            if (settle && inRound && !task.lagging) {
+                if (hop <= SETTLE_DEPTH) {
+                    e.hop = (byte) hop;
+                    link(e, round);
+                    return;
+                }
+                task.lagging = true;
+                e.hop = 0;
+                link(e, round + 1);
+                Scope.anomaly(SPILLED, e.owner);
+                return;
+            }
+            e.hop = 0;
             link(e, round + 1);
             return;
         }
         Entry e = task.entry;
-        e.delay = delay;
+        e.delay = settle ? 0 : delay;
         pushInbox(e);
     }
 
@@ -260,14 +362,15 @@ public final class TickScheduler {
             inboxTail = null;
         }
         while (e != null) {
-            Entry next = e.next;
-            e.next = null;
+            Entry next = e.inboxNext;
+            e.inboxNext = null;
             if (e.kind == COALESCED) {
                 CoalescedTask task = e.coalesced;
                 if (task != null && task.queuedIn() == this && task.entry == e) {
                     int delay = e.delay;
                     Entry linkable = task.entryForLink(this);
                     linkable.delay = delay;
+                    linkable.hop = 0;
                     link(linkable, r);
                 }
             } else if (e.active) {
@@ -370,6 +473,10 @@ public final class TickScheduler {
         Entry e = wheelHead[slot];
         while (e != null) {
             if (e.due > r) {
+                if (!e.active || e.ownerKind == OWNER_SCOPE && !((Scope) e.owner).isActive()) {
+                    e = discard(slot, prev, e);
+                    continue;
+                }
                 prev = e;
                 e = e.next;
                 continue;
@@ -390,16 +497,27 @@ public final class TickScheduler {
                 }
                 case COALESCED -> {
                     CoalescedTask task = e.coalesced;
-                    if (e.active && task != null && task.entry == e) {
-                        task.dequeue(this);
-                        if (!ownerGone(e)) run(e);
-                    }
+                    if (e.active && task != null && task.entry == e && task.dequeue(this) && !ownerGone(e)) run(e);
                 }
                 default -> runLarge((RepeatEntry) e, r);
             }
             if (closed) return;
             e = prev == null ? wheelHead[slot] : prev.next;
         }
+    }
+
+    private Entry discard(int slot, @Nullable Entry prev, Entry e) {
+        Entry next = e.next;
+        if (prev == null) wheelHead[slot] = next;
+        else prev.next = next;
+        if (wheelTail[slot] == e) wheelTail[slot] = prev;
+        e.next = null;
+        e.linked = false;
+        linked--;
+        CoalescedTask task = e.coalesced;
+        if (task != null && task.entry == e) task.dequeue(this);
+        e.active = false;
+        return next;
     }
 
     private void runLarge(RepeatEntry e, long r) {
@@ -424,6 +542,7 @@ public final class TickScheduler {
     }
 
     private void run(Entry e) {
+        depth = e.hop;
         try {
             e.invoke();
         } catch (Throwable t) {
@@ -505,6 +624,7 @@ public final class TickScheduler {
 
         final byte kind;
         final byte ownerKind;
+        byte hop;
         boolean active = true;
         boolean linked;
         final @Nullable Object owner;
@@ -515,6 +635,8 @@ public final class TickScheduler {
         long due;
         @Nullable
         Entry next;
+        @Nullable
+        Entry inboxNext;
 
         Entry(TickScheduler scheduler, byte kind, @Nullable Object owner, @Nullable Runnable action, @Nullable CoalescedTask coalesced) {
             this.scheduler = scheduler;
