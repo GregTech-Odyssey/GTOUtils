@@ -20,7 +20,7 @@ import java.util.function.Predicate;
  * <li>{@link #schedule}：一次性任务，delay 轮后执行；在轮外提交时 delay 为 0 指即将到来的那一轮，在轮内提交时最早下一轮；同一轮按提交顺序执行</li>
  * <li>{@link #scheduleAt}/{@link #currentTick}：按绝对轮次排一次性任务，早于可执行的最早一轮时顺延到那一轮；currentTick 在轮内是当前轮，在轮外是即将到来的那一轮，只在调度线程上有意义</li>
  * <li>{@link #submit}：合并任务 {@link CoalescedTask}，排队期间再提交不重复加入；带延迟时窗口内多次提交只在窗口末尾执行一次</li>
- * <li>{@link #repeat}：周期任务，按 {@link Cadence} 的周期与相位执行，自动相位在同周期的各相位之间轮流分配；所有者是方块实体或实体时随其移除停止，是作用域时随其结束停止，until 为真时停止</li>
+ * <li>{@link #repeat}：周期任务，按 {@link Cadence} 的周期与相位执行；自动相位的任务第一次在挂上后最早可执行的那一轮执行，之后在同周期的各相位之间轮流分配；所有者是方块实体或实体时随其移除停止，是作用域时随其结束停止，until 为真时停止</li>
  * <li>{@link Task#setPeriod}：改周期，在该任务下一次执行之后生效</li>
  * <li>任何线程都能提交和取消：在调度线程上直接挂入，其它线程经收件箱在下一轮开头并入；任务只在调度线程上执行</li>
  * <li>{@link #runRound}：推进一轮，只访问本轮到期的条目；周期任务按周期分组、组内按相位分桶，条目常驻不动；一次性任务与超长周期走 256 槽时间轮</li>
@@ -394,8 +394,19 @@ public final class TickScheduler {
 
     private void placeRepeat(RepeatEntry e, long base) {
         int p = e.period;
+        if (e.fresh) {
+            e.fresh = false;
+            if (e.autoPhase && p > 1) {
+                e.group = null;
+                e.due = base;
+                wheelAppend(e);
+                return;
+            }
+        }
         if (p > MAX_GROUP_PERIOD) {
             long phase = e.autoPhase ? Math.floorMod(largeCursor++, p) : e.phase;
+            e.autoPhase = false;
+            e.phase = (int) phase;
             e.group = null;
             e.due = base + Math.floorMod(phase - base, (long) p);
             wheelAppend(e);
@@ -411,6 +422,7 @@ public final class TickScheduler {
             groups = grown;
         }
         int phase = e.autoPhase ? g.nextPhase() : e.phase;
+        e.autoPhase = false;
         e.group = g;
         g.append(e, phase);
         e.linked = true;
@@ -533,6 +545,11 @@ public final class TickScheduler {
             e.period = np;
             e.autoPhase = false;
             e.phase = (int) Math.floorMod(r, (long) np);
+            e.notBefore = r + 1;
+            placeRepeat(e, r + 1);
+            return;
+        }
+        if (e.autoPhase) {
             e.notBefore = r + 1;
             placeRepeat(e, r + 1);
             return;
@@ -680,6 +697,7 @@ public final class TickScheduler {
         int period;
         int phase;
         boolean autoPhase;
+        boolean fresh = true;
         long notBefore;
         @Nullable
         Group group;

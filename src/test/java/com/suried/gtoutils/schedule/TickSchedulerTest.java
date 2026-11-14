@@ -3,6 +3,7 @@ package com.suried.gtoutils.schedule;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -153,6 +154,9 @@ class TickSchedulerTest {
         int period = 20;
         int[] perRound = new int[period];
         for (int i = 0; i < 1000; i++) s.repeat(Cadence.every(period), () -> perRound[(int) (s.round() % period)]++);
+        s.runRound();
+        assertEquals(1000, perRound[(int) (s.round() % period)]);
+        Arrays.fill(perRound, 0);
         for (int i = 0; i < period; i++) s.runRound();
         int min = Integer.MAX_VALUE, max = 0;
         for (int c : perRound) {
@@ -164,14 +168,55 @@ class TickSchedulerTest {
     }
 
     @Test
-    void periodicFirstRunFallsWithinOnePeriod() {
+    void autoPhaseFirstRunIsImmediateThenSettlesOnAPhase() {
+        for (int period : new int[] { 1, 7, 80, TickScheduler.MAX_GROUP_PERIOD, TickScheduler.MAX_GROUP_PERIOD + 3 }) {
+            TickScheduler s = started();
+            for (int k = 0; k < 5; k++) s.repeat(Cadence.every(period), () -> {});
+            long r = s.round();
+            List<Long> ran = new ArrayList<>();
+            s.repeat(Cadence.every(period), () -> ran.add(s.round()));
+            for (int i = 0; i < period * 4 + 2; i++) s.runRound();
+            assertEquals(r + 1, ran.get(0), "period " + period);
+            assertTrue(ran.size() >= 4, "period " + period);
+            assertTrue(ran.get(1) - ran.get(0) >= 1 && ran.get(1) - ran.get(0) <= period, "period " + period);
+            for (int i = 2; i < ran.size(); i++) assertEquals(period, ran.get(i) - ran.get(i - 1), "period " + period);
+        }
+    }
+
+    @Test
+    void autoPhaseFirstRunInsideARoundIsNextRound() {
+        TickScheduler s = started();
+        List<Long> ran = new ArrayList<>();
+        long[] attachedIn = new long[1];
+        s.schedule(() -> {
+            attachedIn[0] = s.round();
+            s.repeat(Cadence.every(40), () -> ran.add(s.round()));
+        });
+        for (int i = 0; i < 5; i++) s.runRound();
+        assertEquals(attachedIn[0] + 1, ran.get(0));
+    }
+
+    @Test
+    void autoPhaseCancelledBeforeFirstRunNeverRuns() {
+        TickScheduler s = started();
+        int[] ran = new int[1];
+        Task t = s.repeat(Cadence.every(20), () -> ran[0]++);
+        t.cancel();
+        for (int i = 0; i < 60; i++) s.runRound();
+        assertEquals(0, ran[0]);
+        assertEquals(0, s.linkedCount());
+    }
+
+    @Test
+    void autoPhaseSetPeriodBeforeFirstRunAppliesAfterIt() {
         TickScheduler s = started();
         long r = s.round();
         List<Long> ran = new ArrayList<>();
-        s.repeat(Cadence.every(7), () -> ran.add(s.round()));
+        Task t = s.repeat(Cadence.every(20), () -> ran.add(s.round()));
+        t.setPeriod(5);
         for (int i = 0; i < 30; i++) s.runRound();
-        assertTrue(ran.get(0) >= r + 1 && ran.get(0) <= r + 7);
-        for (int i = 1; i < ran.size(); i++) assertEquals(7, ran.get(i) - ran.get(i - 1));
+        assertEquals(r + 1, ran.get(0));
+        for (int i = 1; i < ran.size(); i++) assertEquals(5, ran.get(i) - ran.get(i - 1));
     }
 
     @Test
